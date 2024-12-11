@@ -18,14 +18,15 @@ export class SettingsCommand extends Command {
 
   async showSettingsMenu(chatId, userInfo) {
     try {
-      const user = await User.findOne({ telegramId: userInfo.id.toString() });
+      const user = await User.findOne({ telegramId: userInfo.id.toString() }).lean();
       const currentNetwork = await networkService.getCurrentNetwork(userInfo.id);
 
       const keyboard = this.createKeyboard([
         [{ text: '🔄 Switch Network', callback_data: 'switch_network' }],
+        [{ text: '⚙️ Slippage Settings', callback_data: 'slippage_settings' }],
+        [{ text: '🤖 Autonomous Trading', callback_data: 'autonomous_settings' }],
         [{ text: '🔔 Notification Settings', callback_data: 'notification_settings' }],
         [{ text: '🫅 Butler Assistant', callback_data: 'butler_assistant' }],
-        [{ text: '🤖 Autonomous Wallet', callback_data: 'autonomous_wallet' }],
         [{ text: '↩️ Back to Menu', callback_data: '/start' }]
       ]);
 
@@ -33,9 +34,10 @@ export class SettingsCommand extends Command {
         chatId,
         `*Settings* ⚙️\n\n` +
         `Current Network: *${networkService.getNetworkDisplay(currentNetwork)}*\n` +
+        `Slippage: ${user?.settings?.trading?.slippage[currentNetwork]}%\n` +
+        `Autonomous Trading: ${user?.settings?.trading?.autonomousEnabled ? '✅' : '❌'}\n` +
         `Notifications: ${user?.settings?.notifications?.enabled ? '✅' : '❌'}\n` +
-        `Butler: ${user?.settings?.butler?.enabled ? '✅' : '❌'}\n` +
-        `Autonomous Wallet: ${user?.settings?.autonomousWallet?.address ? '✅' : '❌'}\n\n` +
+        `Butler: ${user?.settings?.butler?.enabled ? '✅' : '❌'}\n\n` +
         'Configure your preferences:',
         { 
           parse_mode: 'Markdown',
@@ -55,42 +57,27 @@ export class SettingsCommand extends Command {
 
     try {
       switch (action) {
-        case 'switch_network':
-          await networkService.showNetworkSelection(this.bot, chatId);
+        case 'slippage_settings':
+          await this.showSlippageSettings(chatId, userInfo);
           return true;
 
-        case 'notification_settings':
-          await this.showNotificationSettings(chatId, userInfo);
+        case 'autonomous_settings':
+          await this.showAutonomousSettings(chatId, userInfo);
           return true;
 
-        case 'butler_assistant':
-          await this.showButlerSettings(chatId, userInfo);
+        // Handle slippage adjustments for each network
+        case 'adjust_eth_slippage':
+        case 'adjust_base_slippage':
+        case 'adjust_sol_slippage':
+          const network = action.split('_')[1];
+          await this.showSlippageInput(chatId, network, userInfo);
           return true;
 
-        case 'autonomous_wallet':
-          await this.showAutonomousWalletSettings(chatId, userInfo);
+        case 'toggle_autonomous':
+          await this.toggleAutonomousTrading(chatId, userInfo);
           return true;
 
-        case 'back_to_settings':
-          await this.showSettingsMenu(chatId, userInfo);
-          return true;
-
-        default:
-          if (action.startsWith('network_')) {
-            const network = action.replace('network_', '');
-            await networkService.setCurrentNetwork(userInfo.id, network);
-            await this.showSettingsMenu(chatId, userInfo);
-            return true;
-          }
-          if (action.startsWith('notifications_')) {
-            await this.handleNotificationToggle(chatId, action, userInfo);
-            return true;
-          }
-          if (action.startsWith('set_autonomous_')) {
-            const walletAddress = action.replace('set_autonomous_', '');
-            await this.handleAutonomousWalletSelection(chatId, walletAddress, userInfo);
-            return true;
-          }
+        // Previous cases remain...
       }
     } catch (error) {
       console.error('Error handling settings action:', error);
@@ -99,6 +86,80 @@ export class SettingsCommand extends Command {
     return false;
   }
 
-  // Additional methods for settings management...
-  // Implementation continues with methods for handling different settings sections
+  async showSlippageSettings(chatId, userInfo) {
+    const user = await User.findOne({ telegramId: userInfo.id.toString() }).lean();
+    const keyboard = this.createKeyboard([
+      [{ text: `ETH (${user?.settings?.trading?.slippage?.ethereum}%)`, callback_data: 'adjust_eth_slippage' }],
+      [{ text: `Base (${user?.settings?.trading?.slippage?.base}%)`, callback_data: 'adjust_base_slippage' }],
+      [{ text: `Solana (${user?.settings?.trading?.slippage?.solana}%)`, callback_data: 'adjust_sol_slippage' }],
+      [{ text: '↩️ Back', callback_data: 'back_to_settings' }]
+    ]);
+
+    await this.bot.sendMessage(
+      chatId,
+      '*Slippage Settings* ⚙️\n\n' +
+      'Adjust slippage tolerance for each network.\n' +
+      'Current settings:\n\n' +
+      `• Ethereum: ${user?.settings?.trading?.slippage?.ethereum}%\n` +
+      `• Base: ${user?.settings?.trading?.slippage?.base}%\n` +
+      `• Solana: ${user?.settings?.trading?.slippage?.solana}%\n\n` +
+      'Select a network to adjust:',
+      {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      }
+    );
+  }
+
+  async showAutonomousSettings(chatId, userInfo) {
+    const user = await User.findOne({ telegramId: userInfo.id.toString() }).lean();
+    const isEnabled = user?.settings?.trading?.autonomousEnabled;
+
+    const keyboard = this.createKeyboard([
+      [{ 
+        text: isEnabled ? '🔴 Disable Autonomous Trading' : '🟢 Enable Autonomous Trading', 
+        callback_data: 'toggle_autonomous' 
+      }],
+      [{ text: '↩️ Back', callback_data: 'back_to_settings' }]
+    ]);
+
+    await this.bot.sendMessage(
+      chatId,
+      '*Autonomous Trading Settings* 🤖\n\n' +
+      'When enabled, AI will process voice commands and natural language for trading.\n\n' +
+      `Current status: ${isEnabled ? '✅ Enabled' : '❌ Disabled'}\n\n` +
+      'Select an action:',
+      {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
+      }
+    );
+  }
+
+  async toggleAutonomousTrading(chatId, userInfo) {
+    const user = await User.findOne({ telegramId: userInfo.id.toString() }).lean();
+    const newState = !user?.settings?.trading?.autonomousEnabled;
+
+    await User.updateOne(
+      { telegramId: userInfo.id.toString() },
+      { 
+        $set: { 
+          'settings.trading.autonomousEnabled': newState 
+        } 
+      }
+    );
+
+    await this.bot.sendMessage(
+      chatId,
+      `✅ Autonomous trading ${newState ? 'enabled' : 'disabled'} successfully!`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '↩️ Back', callback_data: 'autonomous_settings' }
+          ]]
+        }
+      }
+    );
+  }
+
 }

@@ -1,4 +1,5 @@
 import { CommandRegistry } from './registry.js';
+import { ErrorHandler } from '../core/errors/index.js';
 
 export function setupCommands(bot) {
   const registry = new CommandRegistry(bot);
@@ -12,9 +13,10 @@ export function setupCommands(bot) {
       }
       await bot.answerCallbackQuery(query.id);
     } catch (error) {
+      await ErrorHandler.handle(error, bot, query.from.id); // Log and notify user
       console.error('Error handling callback query:', error);
       await bot.answerCallbackQuery(query.id, {
-        text: '❌ An error occurred',
+        text: '❌ An error occurred while processing your request.',
         show_alert: true
       });
     }
@@ -25,6 +27,7 @@ export function setupCommands(bot) {
     try {
       await registry.handleMessage(msg);
     } catch (error) {
+      await ErrorHandler.handle(error, bot, msg.chat.id); // Log and notify user
       console.error('Error handling message:', error);
     }
   });

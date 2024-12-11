@@ -1,41 +1,41 @@
 # Dependencies
 node_modules/
-package-lock.json
+dist/
 
 # Environment
 .env
-.env.local
-.env.*.local
-
-# Build output
-dist/
-build/
+.env.*
+!.env.example
 
 # Logs
 logs/
 *.log
 npm-debug.log*
 
-# IDE/Editor
-.vscode/
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Testing
+coverage/
+
+# IDEs and editors
 .idea/
+.vscode/
 *.swp
 *.swo
 
-# OS
+# OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-# Temporary files
-temp/
-tmp/
-*.tmp
-
-# Test coverage
-coverage/
-
-# Debug
-.debug/
-
-# Local development
-*.local
+# Build files
+build/
+dist/

@@ -1,33 +1,42 @@
-// src/core/errors/ErrorTypes.js
 export const ErrorTypes = {
-  RATE_LIMIT: 'RATE_LIMIT_ERROR',
-  NETWORK: 'NETWORK_ERROR',
-  DATABASE: 'DATABASE_ERROR',
-  VALIDATION: 'VALIDATION_ERROR',
-  AUTH: 'AUTH_ERROR',
-  WALLET: 'WALLET_ERROR',
-  API: 'API_ERROR'
+  RATE_LIMIT: 'RATE_LIMIT',
+  NETWORK: 'NETWORK',
+  DATABASE: 'DATABASE',
+  VALIDATION: 'VALIDATION',
+  AUTH: 'AUTH',
+  WALLET: 'WALLET',
+  API: 'API',
 };
 
 export class BaseError extends Error {
-  constructor(type, message, details = {}) {
+  constructor(message, type = 'DEFAULT', isCritical = false) {
     super(message);
     this.type = type;
-    this.details = details;
-    this.timestamp = new Date();
+    this.isCritical = isCritical;
   }
 }
 
+// Define specific error classes more needed for APIs
 export class RateLimitError extends BaseError {
-  constructor(message, details) {
-    super(ErrorTypes.RATE_LIMIT, message, details);
+  constructor(message = 'Rate limit exceeded') {
+    super(message, ErrorTypes.RATE_LIMIT, false);
+  }
+}
+
+export class DatabaseError extends BaseError {
+  constructor(message = 'Database error occurred') {
+    super(message, ErrorTypes.DATABASE, true);
   }
 }
 
 export class NetworkError extends BaseError {
-  constructor(message, details) {
-    super(ErrorTypes.NETWORK, message, details);
+  constructor(message = 'Network error occurred') {
+    super(message, ErrorTypes.NETWORK, false);
   }
 }
 
-// Add other error classes...
+export class WalletError extends BaseError {
+  constructor(message = 'Wallet operation failed') {
+    super(message, ErrorTypes.WALLET, true);
+  }
+}

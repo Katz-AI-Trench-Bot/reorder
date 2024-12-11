@@ -1,74 +1,195 @@
-import { openai } from './openai.js';
-import { speechToText } from './speech.js';
-import { textToSpeech } from './speech.js';
-import { systemPrompts } from './prompts.js';
+import { openAIService } from './openai.js';
+import { TRADING_INTENTS, matchIntent, formatIntentResponse } from './intents.js';
+import { dextools } from '../dextools/index.js';
+import { timedOrderService } from '../timedOrders.js';
+import { priceAlertService } from '../priceAlerts.js';
+import { tradingService } from '../trading/index.js';
+import { walletService } from '../../services/wallet/index.js';
+import { networkState } from '../networkState.js';
+import { circuitBreakers } from '../../core/circuit-breaker/index.js';
+import { BREAKER_CONFIGS } from '../../core/circuit-breaker/index.js';
+import { User } from '../../models/User.js';
+import { audioService } from './speech.js';
+import axios from 'axios';
 
-export class AIService {
+class AIService {
   constructor() {
-    this.openai = openai;
     this.conversationHistory = new Map();
   }
 
-  async generateResponse(input, purpose, userId = null) {
-    try {
-      // Get conversation history for this user
-      let messages = [];
-      if (userId) {
-        messages = this.conversationHistory.get(userId) || [];
-      }
+  async processVoiceCommand(audioBuffer, userId) {
+    return circuitBreakers.executeWithBreaker(
+      'openai',
+      async () => {
+        const text = await this.convertVoiceToText(audioBuffer);
+        const intent = matchIntent(text) || await this.classifyIntent(text);
 
-      // Add system prompt and user input
-      if (messages.length === 0) {
-        messages.push({
-          role: "system",
-          content: systemPrompts[purpose] || systemPrompts.general
+        const result = await this.processCommand(text, intent, userId);
+        const confirmationAudio = await audioService.textToSpeech(`On it sir. Processing your request.. ${text}`);
+        const responseAudio = await audioService.textToSpeech(result.text);
+
+        return {
+          text: result.text,
+          intent: result.intent,
+          data: result.data,
+          confirmationAudio,
+          responseAudio,
+        };
+      },
+      BREAKER_CONFIGS.openai
+    );
+  }
+
+  async processCommand(text, intent, userId) {
+    try {
+      const history = this.getHistory(userId);
+      history.push({ role: 'user', content: text });
+
+      const result = await this.executeIntent(intent, userId);
+      const response = formatIntentResponse(intent, result, userId);
+
+      history.push({ role: 'assistant', content: response });
+      this.updateHistory(userId, history);
+
+      return { text: response, intent, data: result };
+    } catch (error) {
+      console.error('Error processing command:', error);
+      throw error;
+    }
+  }
+
+  async classifyIntent(text) {
+    try {
+      const response = await openAIService.generateAIResponse(text, 'intent_classification');
+      return JSON.parse(response).intent || null;
+    } catch (error) {
+      console.error('Error classifying intent:', error);
+      throw error;
+    }
+  }
+  
+  async executeIntent(intent, userId) {
+    const network = await networkState.getCurrentNetwork(userId);
+
+    switch (intent.type) {
+      case TRADING_INTENTS.TRENDING_CHECK:
+        return await dextools.fetchTrendingTokens(network);
+
+      case TRADING_INTENTS.TOKEN_SCAN:
+        return await dextools.formatTokenAnalysis(network, intent.token);
+
+      case TRADING_INTENTS.PRICE_ALERT:
+        return await this.handlePriceAlert(intent, userId, network);
+
+      case TRADING_INTENTS.TIMED_ORDER:
+        return await timedOrderService.createOrder(userId, {
+          tokenAddress: intent.token,
+          network,
+          action: intent.action,
+          amount: intent.amount,
+          executeAt: new Date(intent.timing),
         });
-      }
 
-      messages.push({
-        role: "user",
-        content: input
-      });
+      case TRADING_INTENTS.QUICK_TRADE:
+        return await tradingService.executeTrade(network, {
+          action: intent.action,
+          tokenAddress: intent.token,
+          amount: intent.amount,
+        });
 
-      const response = await this.openai.chat.completions.create({
-        model: purpose === 'image' ? "gpt-4-vision-preview" : "gpt-3.5-turbo",
-        messages,
-        temperature: 0.7,
-        max_tokens: 500
-      });
+      case TRADING_INTENTS.GEMS_TODAY:
+        return await this.getGemsToday();
 
-      const reply = response.choices[0].message;
-      messages.push(reply);
+      case TRADING_INTENTS.INTERNET_SEARCH:
+        return await this.performInternetSearch(intent.query);
 
-      if (userId) {
-        this.conversationHistory.set(userId, messages);
-      }
-
-      return reply.content;
-    } catch (error) {
-      console.error('AI service error:', error);
-      error.name = 'AIServiceError';
-      throw error;
+      default:
+        throw new Error('Unknown intent type');
     }
   }
 
-  async processVoiceCommand(audioBuffer) {
-    try {
-      const text = await speechToText(audioBuffer);
-      const response = await this.generateResponse(text, 'chat');
-      const audioResponse = await textToSpeech(response);
-      return {
-        text,
-        response,
-        audio: audioResponse
-      };
-    } catch (error) {
-      console.error('Voice processing error:', error);
-      throw error;
+  async handlePriceAlert(intent, userId, network) {
+    if (intent.multiTargets) {
+      const alerts = [];
+      for (const target of intent.multiTargets) {
+        const alert = await priceAlertService.createAlert(userId, {
+          tokenAddress: intent.token,
+          network,
+          targetPrice: target.price,
+          condition: 'above',
+          swapAction: {
+            enabled: true,
+            type: 'sell',
+            amount: target.percentage + '%',
+          },
+        });
+        alerts.push(alert);
+      }
+      return alerts;
+    } else {
+      return await priceAlertService.createAlert(userId, {
+        tokenAddress: intent.token,
+        network,
+        targetPrice: intent.targetPrice,
+        condition: intent.action === 'buy' ? 'below' : 'above',
+        swapAction: {
+          enabled: !!intent.amount,
+          type: intent.action,
+          amount: intent.amount,
+        },
+      });
     }
   }
 
-  clearConversation(userId) {
+  async performInternetSearch(query) {
+    return circuitBreakers.executeWithBreaker(
+      'brave',
+      async () => {
+        try {
+          const response = await axios.get('https://api.search.brave.com/res/v1/web/search', {
+            headers: {
+              'X-Subscription-Token': process.env.BRAVE_API_KEY,
+            },
+            params: {
+              q: query,
+              format: 'json',
+            },
+          });
+
+          return response.data.results.slice(0, 5);
+        } catch (error) {
+          console.error('Error performing internet search:', error);
+          throw error;
+        }
+      },
+      BREAKER_CONFIGS.brave
+    );
+  }
+
+  async getGemsToday() {
+    const today = new Date().setHours(0, 0, 0, 0);
+    const scan = await GemScan.findOne({ date: today }).lean();
+    return scan?.tokens || [];
+  }
+
+  isTradingIntent(intentType) {
+    return [
+      TRADING_INTENTS.QUICK_TRADE,
+      TRADING_INTENTS.PRICE_ALERT,
+      TRADING_INTENTS.TIMED_ORDER,
+    ].includes(intentType);
+  }
+
+  getHistory(userId) {
+    return this.conversationHistory.get(userId) || [];
+  }
+
+  updateHistory(userId, history) {
+    const trimmed = history.slice(-10);
+    this.conversationHistory.set(userId, trimmed);
+  }
+
+  clearHistory(userId) {
     this.conversationHistory.delete(userId);
   }
 }

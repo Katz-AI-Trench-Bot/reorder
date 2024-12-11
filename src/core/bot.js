@@ -1,17 +1,9 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { config } from './config.js';
-import { setupCommands } from '../commands/index.js';
-import { setupEventHandlers } from '../events/index.js';
+import { config } from '../core/config.js';
 
 class Bot {
   constructor() {
     this.instance = new TelegramBot(config.botToken, { polling: true });
-    this.setupHandlers();
-  }
-
-  setupHandlers() {
-    setupCommands(this.instance);
-    setupEventHandlers(this.instance);
   }
 
   async stop() {

@@ -96,6 +96,30 @@ export class EVMTrader extends BaseTrader {
     }
   }
 
+  // EVMTrader class
+  async checkAndRequestApproval(tokenAddress, walletAddress, amount) {
+    const wallet = await walletService.getWallet(walletAddress);
+    
+    if (wallet.type === 'walletconnect') {
+      // Request approval via WalletConnect
+      const contract = new ethers.Contract(
+        tokenAddress,
+        ['function approve(address,uint256)'],
+        this.provider
+      );
+      
+      const approvalTx = await contract.populateTransaction.approve(
+        this.routerAddress,
+        ethers.MaxUint256
+      );
+      
+      return walletConnectService.sendTransaction(wallet.userId, approvalTx);
+    } else {
+      // Internal wallet - use stored private key
+      return super.approve(tokenAddress, walletAddress, amount);
+    }
+  }  
+
   async getTokenPrice(tokenAddress) {
     try {
       const price = await this.alchemy.core.getTokenPrice(tokenAddress);

@@ -1,163 +1,164 @@
-// src/index.js
-import dotenv from 'dotenv';
-dotenv.config();
+  import dotenv from 'dotenv';
+  dotenv.config();
 
-import { bot } from './core/bot.js';
-import { setupCommands } from './commands/index.js';
-import { setupEventHandlers } from './events/index.js';
-import { callbackRegistry } from './utils/callbackRegistry.js';
-import { db } from './core/database.js';
-import { pumpFunService } from './services/pumpfun.js';
-import { walletService } from './services/wallet.js';
-import { networkService } from './services/network/index.js';
-import { healthMonitor } from './core/health/HealthMonitor.js';
-import { rateLimiter } from './core/rate-limiting/RateLimiter.js';
-import { startMonitoringDashboard } from './core/monitoring/Dashboard.js';
-import { setTimeout } from 'timers/promises';
+  import { bot } from './core/bot.js';
+  import { setupCommands } from './commands/index.js';
+  import { setupEventHandlers } from './events/index.js';
+  import { db } from './core/database.js';
+  import { pumpFunService } from './services/pumpfun/index.js';
+  import { gemsService } from './services/gems/GemsService.js';
+  import { walletService } from './services/wallet/index.js';
+  import { networkService } from './services/network/index.js';
+  import { healthMonitor } from './core/health/HealthMonitor.js';
+  import { monitoringSystem } from './core/monitoring/Monitor.js';
+  import { rateLimiter } from './core/rate-limiting/RateLimiter.js';
+  import { startMonitoringDashboard } from './core/monitoring/Dashboard.js';
+  import { ErrorHandler } from './core/errors/index.js';
+  import { setTimeout } from 'timers/promises';
 
-let isShuttingDown = false;
+  let isShuttingDown = false;
 
-async function cleanup(botInstance) {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-
-  console.log('🛑 Shutting down bot...');
-  try {
-    await db.disconnect();
-    pumpFunService.disconnect();
-    walletService.cleanup();
-    networkService.cleanup();
-    callbackRegistry.cleanup();
-    healthMonitor.cleanup();
-
-    if (botInstance) {
-      await botInstance.stopPolling();
+  async function cleanup(botInstance) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+  
+    console.log('🛑 Shutting down AI Agent...');
+    try {
+      await db.disconnect();
+      if (pumpFunService.disconnect) {
+        await pumpFunService.disconnect();
+      } else {
+        console.warn('pumpFunService does not have a disconnect method.');
+      }
+      walletService.cleanup();
+      networkService.cleanup();
+      healthMonitor.cleanup();
+  
+      if (botInstance) {
+        await botInstance.stopPolling();
+      }
+  
+      console.log('✅ Cleanup completed.');
+    } catch (error) {
+      console.error('❌ Error during cleanup:', error);
+    } finally {
+      isShuttingDown = false;
     }
+  }  
 
-    console.log('✅ Cleanup completed.');
-    isShuttingDown = false;
-  } catch (error) {
-    console.error('❌ Error during cleanup:', error);
-  }
-}
-
-async function startBot() {
-  try {
-    console.log('🚀 Starting KATZ Bot...');
-
-    console.log('📡 Connecting to MongoDB Atlas...');
-    await db.connect();
-
-    console.log('🔧 Initializing services...');
-    await Promise.all([
-      walletService.initialize(),
-      networkService.initialize(),
-      callbackRegistry.initialize(),
-    ]);
-
-    console.log('⚡ Connecting to PumpFun service...');
-    await pumpFunService.connect();
-
-    console.log('🤖 Initializing Telegram bot...');
-    const botInstance = bot;
-
-    console.log('📜 Setting up command handlers...');
-    setupCommands(botInstance);
-
-    console.log('🎛 Setting up event handlers...');
-    setupEventHandlers(botInstance);
-
-    console.log('⚠️ Setting up error handlers...');
-    setupBotErrorHandlers(botInstance);
-
-    console.log('🔍 Starting health monitoring...');
-    healthMonitor.startMonitoring();
-
-    console.log('📊 Starting monitoring dashboard...');
-    startMonitoringDashboard();
-
-    console.log('✅ KATZ Bot is up and running!');
-    return botInstance;
-
-  } catch (error) {
-    console.error('❌ Error starting bot:', error);
-    await cleanup(bot);
-    process.exit(1);
-  }
-}
-
-function setupBotErrorHandlers(botInstance) {
-  botInstance.on('error', async (error) => {
-    console.error('Telegram bot error:', error);
-    await tryRestartBot();
-  });
-
-  botInstance.on('polling_error', async (error) => {
-    console.error('Polling error:', error);
-    await tryRestartBot();
-  });
-
-  botInstance.on('webhook_error', (error) => {
-    console.error('Webhook error:', error);
-  });
-
-  // Handle rate limiting
-  botInstance.on('message', async (msg) => {
-    const isLimited = await rateLimiter.isRateLimited(msg.from.id, 'message');
-    if (isLimited) {
-      await botInstance.sendMessage(
-        msg.chat.id,
-        '⚠️ You are sending too many messages. Please wait a moment.'
-      );
-      return;
+  async function monitoredInitialization(serviceName, service) {
+    console.log(`Initializing ${serviceName}...`);
+    try {
+      await service.initialize();
+      console.log(`${serviceName} initialized successfully.`);
+    } catch (error) {
+      console.error(`${serviceName} failed to initialize:`, error.message);
+      throw error;
     }
-  });
-
-  // Monitor health status
-  healthMonitor.on('criticalError', async ({ services }) => {
-    console.error('Critical service failure:', services);
-    await tryRestartBot();
-  });
-
-  process.on('SIGINT', async () => {
-    console.log('🛑 Received SIGINT. Shutting down gracefully...');
-    await cleanup(botInstance);
-    process.exit(0);
-  });
-
-  process.on('SIGTERM', async () => {
-    console.log('🛑 Received SIGTERM. Shutting down gracefully...');
-    await cleanup(botInstance);
-    process.exit(0);
-  });
-
-  process.on('unhandledRejection', async (error) => {
-    console.error('❌ Unhandled promise rejection:', error);
-    await tryRestartBot();
-  });
-
-  process.on('uncaughtException', async (error) => {
-    console.error('❌ Uncaught exception:', error);
-    await tryRestartBot();
-  });
-}
-
-async function tryRestartBot() {
-  if (isShuttingDown) return;
-
-  console.log('🔄 Attempting to restart the bot...');
-  try {
-    await cleanup(bot);
-    await setTimeout(5000);
-    await startBot();
-  } catch (error) {
-    console.error('❌ Failed to restart the bot:', error);
-    process.exit(1);
   }
-}
 
-startBot().catch(async (error) => {
-  console.error('❌ Unhandled error during startup:', error);
-  await cleanup(bot);
-  process.exit(1);
-});
+  async function startAgent() {
+    try {
+      console.log('🚀 Starting KATZ! AI Agent...');
+
+      // 1. **Database Connection**
+      console.log('📡 Connecting to MongoDB...');
+      await db.connect();
+
+      // 2. **Initialize Independent Services in Parallel**
+      console.log('🔧 Initializing independent services...');
+      await Promise.all([
+        monitoredInitialization('RateLimiter', rateLimiter),
+        monitoredInitialization('WalletService', walletService),
+        monitoredInitialization('NetworkService', networkService),
+      ]);
+
+      // 3. **Sequential Initialization for Dependent Services**
+      console.log('🔗 Connecting Pumpfun services...');
+      await pumpFunService.connect(); // pumpFun may depend on networkService or walletService.
+
+      // 4. Gem Service
+      console.log('🔗 Connecting Gem services...');
+      await gemsService.initialize();
+      
+      //5. System Monitoring Stats Service    
+      console.log('🔍 Initializing System Stat Service...');
+      await monitoringSystem.initialize();
+
+      // 5. Services Health Monitors
+      console.log('🔍 Initializing Health Monitor...');
+      await healthMonitor.initialize(); // HealthMonitor depends on services and DB.
+
+      // 4. **Start Telegram Bot**
+      console.log('🤖 Starting Telegram Interface...');
+      const botInstance = bot;
+
+      console.log('📜 Setting up Telegram command handlers...');
+      setupCommands(botInstance);
+
+      console.log('🎛 Setting up Telegram event handlers...');
+      setupEventHandlers(botInstance, { rateLimiter });
+
+      // 5. **Start Health Monitoring and Dashboard**
+      console.log('🔍 Starting Agent health monitoring...');
+      healthMonitor.startMonitoring();
+
+      console.log('📊 Starting Agent monitoring dashboard...');
+      startMonitoringDashboard();
+
+      console.log('✅ KATZ AI Agent is up and running!');
+      return botInstance;
+
+    } catch (error) {
+      console.error('❌ Error starting KATZ AI Agent:', error);
+      await cleanup(bot);
+      process.exit(1);
+    }
+  }
+
+  function setupErrorHandlers(botInstance) {
+    process.on('SIGINT', async () => {
+      console.log('🛑 Received SIGINT. Shutting down...');
+      await cleanup(botInstance);
+      process.exit(0);
+    });
+
+    process.on('SIGTERM', async () => {
+      console.log('🛑 Received SIGTERM. Shutting down...');
+      await cleanup(botInstance);
+      process.exit(0);
+    });
+
+    process.on('uncaughtException', async (error) => {
+      console.error('❌ Uncaught Exception:', error);
+      await ErrorHandler.handle(error);
+    });
+    
+    process.on('unhandledRejection', async (reason) => {
+      console.error('❌ Unhandled Promise Rejection:', reason);
+      await ErrorHandler.handle(reason);
+    });
+    
+  }
+
+  // System Health Event Listeners
+  monitoringSystem.on('metricsCollected', (metrics) => {
+    console.log('Metrics Collected:', JSON.stringify(metrics, null, 2));
+  });
+
+  monitoringSystem.on('error', (error) => {
+    console.error('Monitoring Error:', error);
+  });
+
+  healthMonitor.on('serviceError', (error) => {
+    console.error('Service Error:', JSON.stringify(error, null, 2));
+  });
+
+  // Install global error handlers
+  ErrorHandler.initializeGlobalHandlers(); 
+
+  // Start the agent
+  (async () => {
+    const botInstance = await startAgent();
+    setupErrorHandlers(botInstance);
+  })();

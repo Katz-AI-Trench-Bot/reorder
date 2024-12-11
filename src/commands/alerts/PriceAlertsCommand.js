@@ -1,7 +1,9 @@
 import { Command } from '../base/Command.js';
 import { PriceAlert } from '../../models/PriceAlert.js';
+import { tradingService } from '../../services/trading/index.js';
 import { networkService } from '../../services/network/index.js';
 import { dextools } from '../../services/dextools/index.js';
+import { walletService } from '../../services/wallet/index.js';
 import { User } from '../../models/User.js';
 import { USER_STATES } from '../../core/constants.js';
 
@@ -42,21 +44,28 @@ export class PriceAlertsCommand extends Command {
 
   async handleCallback(query) {
     const chatId = query.message.chat.id;
-    const action = query.data;
     const userInfo = query.from;
-
+  
     try {
-      switch (action) {
+      const callbackData = JSON.parse(query.data);
+  
+      switch (callbackData.action) {
         case 'create_price_alert':
           await this.startAlertCreation(chatId, userInfo);
           return true;
-
+  
         case 'view_price_alerts':
           await this.showUserAlerts(chatId, userInfo);
           return true;
-
+  
         case 'enable_swap':
-          await this.handleEnableSwap(chatId, userInfo);
+          await this.handleEnableSwap(
+            chatId, 
+            userInfo, 
+            callbackData.tokenAddress, 
+            callbackData.walletAddress, 
+            callbackData.amount
+          );
           return true;
 
         case 'skip_swap':
@@ -171,23 +180,47 @@ export class PriceAlertsCommand extends Command {
 
   // Additional methods for price alert management...
     
-  async function handleEnableSwap(bot, chatId, userInfo) {
-    const user = await User.findOne({ telegramId: userInfo.id.toString() });
+  async handleEnableSwap(chatId, userInfo, tokenAddress, walletAddress, amount) {
+    const user = await User.findOne({ telegramId: userInfo.id.toString() }).lean();
+    const wallet = await walletService.getActiveWallet(userInfo.id);
     
-    if (!user?.settings?.autonomousWallet?.address) {
-      await promptSetAutonomousWallet(bot, chatId);
+    if (!wallet) {
+      await this.bot.sendMessage(
+        chatId,
+        '❌ Please select or create a wallet first.',
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '👛 Go to Wallets', callback_data: '/wallets' }
+            ]]
+          }
+        }
+      );
       return;
     }
-  
-    const keyboard = createKeyboard([
+
+    if (wallet.type === 'walletconnect') {
+      // Request pre-approval for external wallets
+      const approvalStatus = await tradingService.checkAndRequestApproval(tokenAddress, walletAddress, amount);
+      if (!approvalStatus.approved) {
+        throw new Error('Token approval required');
+      }
+    }
+
+    const userData = await this.getUserData(userInfo.id);
+    userData.pendingAlert.walletAddress = wallet.address;
+    userData.pendingAlert.walletType = wallet.type;
+    await this.setUserData(userInfo.id, userData);
+
+    const keyboard = this.createKeyboard([
       [
         { text: '📈 Buy', callback_data: 'swap_buy' },
         { text: '📉 Sell', callback_data: 'swap_sell' }
       ],
       [{ text: '❌ Cancel', callback_data: 'back_to_price_alerts' }]
     ]);
-  
-    await bot.sendMessage(
+
+    await this.bot.sendMessage(
       chatId,
       '*Auto-Swap Settings* ⚙️\n\n' +
       'Choose the swap action that will be performed when price triggers:',
@@ -197,10 +230,63 @@ export class PriceAlertsCommand extends Command {
       }
     );
   }
+
+  async savePriceAlert(chatId, userInfo) {
+    try {
+      const userData = await this.getUserData(userInfo.id);
+      const alertData = userData?.pendingAlert;
+
+      if (!alertData) {
+        throw new Error('No pending alert data found');
+      }
+
+      const alert = new PriceAlert({
+        userId: userInfo.id.toString(),
+        tokenAddress: alertData.tokenAddress,
+        network: alertData.network,
+        targetPrice: alertData.targetPrice,
+        condition: alertData.condition,
+        isActive: true,
+        swapAction: alertData.swapAction,
+        walletAddress: alertData.walletAddress,
+        walletType: alertData.walletType
+      });
+
+      await alert.save();
+
+      let message = '✅ Price alert created!\n\n' +
+                   `Token: ${alertData.tokenInfo.symbol}\n` +
+                   `Target Price: $${alertData.targetPrice}\n` +
+                   `Condition: ${alertData.condition}\n` +
+                   `Network: ${networkService.getNetworkDisplay(alert.network)}`;
+
+      if (alert.swapAction?.enabled) {
+        message += `\n\nAuto-${alert.swapAction.type} will execute when triggered`;
+        if (alertData.walletType === 'walletconnect') {
+          message += '\n\n⚠️ _You will need to approve the transaction when triggered_';
+        }
+      }
+
+      await this.bot.sendMessage(chatId, message, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '📋 View Alerts', callback_data: 'view_price_alerts' },
+            { text: '↩️ Back', callback_data: 'back_to_notifications' }
+          ]]
+        }
+      });
+
+      await this.clearState(userInfo.id);
+    } catch (error) {
+      console.error('Error saving price alert:', error);
+      await this.showErrorMessage(chatId, error);
+    }
+  }
   
-  async function handleSwapTypeSelection(bot, chatId, type, userInfo) {
+  async handleSwapTypeSelection(bot, chatId, type, userInfo) {
     const userData = await UserState.getUserData(userInfo.id);
-    const user = await User.findOne({ telegramId: userInfo.id.toString() });
+    const user = await User.findOne({ telegramId: userInfo.id.toString() }).lean();
   
     userData.pendingAlert.swapAction = {
       enabled: true,
@@ -226,7 +312,7 @@ export class PriceAlertsCommand extends Command {
     );
   }
   
-  async function handleSwapAmountInput(bot, chatId, amount, userInfo) {
+  async handleSwapAmountInput(bot, chatId, amount, userInfo) {
     if (isNaN(amount) || parseFloat(amount) <= 0) {
       await bot.sendMessage(
         chatId,
@@ -249,81 +335,37 @@ export class PriceAlertsCommand extends Command {
     await showAlertConfirmation(bot, chatId, userInfo);
   }
   
-  async function showAlertConfirmation(bot, chatId, userInfo) {
-    const userData = await UserState.getUserData(userInfo.id);
+  async showAlertConfirmation(chatId, userInfo) {
+    const userData = await this.getUserData(userInfo.id);
     const { pendingAlert } = userData;
-  
-    const keyboard = createKeyboard([
-      [
-        { text: '✅ Confirm', callback_data: 'confirm_alert' },
-        { text: '❌ Cancel', callback_data: 'cancel_alert' }
-      ]
-    ]);
-  
+    
+    const wallet = await walletService.getWallet(userInfo.id, pendingAlert.walletAddress);
+    const needsApproval = wallet.type === 'walletconnect' && pendingAlert.swapAction?.enabled;
+    
     let message = '*Confirm Price Alert* ✅\n\n' +
                   `Token: ${pendingAlert.tokenInfo.symbol}\n` +
                   `Target Price: $${pendingAlert.targetPrice}\n` +
                   `Condition: ${pendingAlert.condition}\n` +
                   `Network: ${networkState.getNetworkDisplay(pendingAlert.network)}`;
-  
-    if (pendingAlert.swapAction?.enabled) {
-      message += `\n\nAuto-Swap: ${pendingAlert.swapAction.type}\n` +
-                 `Amount: ${pendingAlert.swapAction.amount}`;
+
+    if (needsApproval) {
+      message += '\n\n⚠️ *Note:* This alert requires token approval from your external wallet.';
     }
-  
-    message += '\n\nPlease confirm your alert settings:';
-  
-    await bot.sendMessage(chatId, message, { 
+
+    const keyboard = this.createKeyboard([
+      [
+        { text: '✅ Confirm', callback_data: 'confirm_alert' },
+        { text: '❌ Cancel', callback_data: 'cancel_alert' }
+      ]
+    ]);
+
+    await this.bot.sendMessage(chatId, message, { 
       parse_mode: 'Markdown',
       reply_markup: keyboard 
     });
   }
   
-  async function savePriceAlert(bot, chatId, userInfo) {
-    try {
-      const userData = await UserState.getUserData(userInfo.id);
-      const alertData = userData?.pendingAlert;
-  
-      if (!alertData) {
-        throw new Error('No pending alert data found');
-      }
-  
-      const alert = new PriceAlert({
-        userId: userInfo.id.toString(),
-        tokenAddress: alertData.tokenAddress,
-        network: alertData.network,
-        targetPrice: alertData.targetPrice,
-        condition: alertData.condition,
-        swapAction: alertData.swapAction || { enabled: false },
-        isActive: true
-      });
-  
-      await alert.save();
-  
-      await bot.sendMessage(
-        chatId,
-        '✅ Price alert created successfully!\n\n' +
-        `Token: ${alertData.tokenInfo.symbol}\n` +
-        `Target Price: $${alertData.targetPrice}\n` +
-        `Condition: ${alertData.condition}`,
-        {
-          reply_markup: {
-            inline_keyboard: [[
-              { text: '📋 View Alerts', callback_data: 'view_price_alerts' },
-              { text: '↩️ Back', callback_data: 'back_to_notifications' }
-            ]]
-          }
-        }
-      );
-  
-      await UserState.clearUserState(userInfo.id);
-    } catch (error) {
-      console.error('Error saving price alert:', error);
-      await handlePriceAlertError(bot, chatId);
-    }
-  }
-  
-  async function showUserPriceAlerts(bot, chatId, userInfo) {
+  async showUserPriceAlerts(bot, chatId, userInfo) {
     try {
       const alerts = await PriceAlert.find({ 
         userId: userInfo.id.toString(),
@@ -384,7 +426,7 @@ export class PriceAlertsCommand extends Command {
     }
   }
   
-  async function handleAlertAction(bot, chatId, action, userInfo) {
+  async handleAlertAction(bot, chatId, action, userInfo) {
     try {
       const alertId = action.replace('alert_', '');
       const alert = await PriceAlert.findById(alertId);
@@ -424,7 +466,7 @@ export class PriceAlertsCommand extends Command {
     }
   }
   
-  async function confirmAlertDeletion(bot, chatId, alertId, userInfo) {
+  async confirmAlertDeletion(bot, chatId, alertId, userInfo) {
     try {
       const alert = await PriceAlert.findById(alertId);
       if (!alert || alert.userId !== userInfo.id.toString()) {
@@ -458,7 +500,7 @@ export class PriceAlertsCommand extends Command {
     }
   }
   
-  async function handleAlertDeletion(bot, chatId, alertId, userInfo) {
+  async handleAlertDeletion(bot, chatId, alertId, userInfo) {
     try {
       const alert = await PriceAlert.findOneAndDelete({
         _id: alertId,
@@ -492,7 +534,7 @@ export class PriceAlertsCommand extends Command {
     }
   }
   
-  async function handlePriceAlertError(bot, chatId) {
+  async handlePriceAlertError(bot, chatId) {
     const keyboard = createKeyboard([[
       { text: '🔄 Retry', callback_data: 'view_price_alerts' },
       { text: '↩️ Back', callback_data: 'back_to_notifications' }

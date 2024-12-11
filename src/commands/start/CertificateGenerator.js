@@ -280,4 +280,3 @@ export class CertificateGenerator {
     this.ctx.drawImage(grainCanvas, 0, 0);
   }
 }
-```

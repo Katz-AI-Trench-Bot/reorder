@@ -12,6 +12,12 @@ export class EVMWallet extends BaseWallet {
     });
   }
 
+  async checkHealth() {
+    // Check RPC connection
+    const blockNumber = await this.provider.getBlockNumber();
+    if (!blockNumber) throw new Error('Unable to fetch block number');
+  }
+
   async createWallet() {
     try {
       const wallet = ethers.Wallet.createRandom();

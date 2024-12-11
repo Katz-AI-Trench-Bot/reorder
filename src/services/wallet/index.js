@@ -5,6 +5,7 @@ import { config } from '../../core/config.js';
 import { db } from '../../core/database.js';
 import { encrypt, decrypt } from '../../utils/encryption.js';
 import { EventEmitter } from 'events';
+import { ErrorHandler } from '../../core/errors/index.js'; // Centralized error handling
 
 class WalletService extends EventEmitter {
   constructor() {
@@ -12,29 +13,47 @@ class WalletService extends EventEmitter {
     this.walletProviders = {
       [NETWORKS.ETHEREUM]: new EVMWallet(config.networks.ethereum),
       [NETWORKS.BASE]: new EVMWallet(config.networks.base),
-      [NETWORKS.SOLANA]: new SolanaWallet(config.networks.solana)
+      [NETWORKS.SOLANA]: new SolanaWallet(config.networks.solana),
     };
     this.walletCache = new Map();
     this.CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+    this.usersCollection = null;
+    this.metricsCollection = null; // For storing wallet tallies
   }
 
   async initialize() {
     try {
-      this.usersCollection = db.getDatabase().collection('users');
+      const database = db.getDatabase();
+      this.usersCollection = database.collection('users');
+      this.metricsCollection = database.collection('walletMetrics');
+
+      // Ensure tallies are initialized in the database
+      await this.initializeMetrics();
+
+      console.log('✅ WalletService initialized successfully.');
       this.emit('initialized');
-      return true;
     } catch (error) {
-      this.emit('error', error);
+      await ErrorHandler.handle(error, null, null, 'Error initializing WalletService');
       throw error;
     }
   }
 
-  getProvider(network) {
-    const provider = this.walletProviders[network];
-    if (!provider) {
-      throw new Error(`Unsupported network: ${network}`);
+  async initializeMetrics() {
+    try {
+      // Ensure metrics for each network exist
+      const networks = [NETWORKS.ETHEREUM, NETWORKS.BASE, NETWORKS.SOLANA];
+      for (const network of networks) {
+        await this.metricsCollection.updateOne(
+          { network },
+          { $setOnInsert: { network, walletCount: 0 } }, // Initialize walletCount if it doesn't exist
+          { upsert: true }
+        );
+      }
+      console.log('✅ Wallet metrics initialized.');
+    } catch (error) {
+      console.error('❌ Error initializing wallet metrics:', error);
+      throw error;
     }
-    return provider;
   }
 
   async createWallet(userId, network) {
@@ -46,48 +65,70 @@ class WalletService extends EventEmitter {
         address: wallet.address,
         encryptedPrivateKey: encrypt(wallet.privateKey),
         encryptedMnemonic: encrypt(wallet.mnemonic),
-        createdAt: new Date()
+        createdAt: new Date(),
       };
 
       await this.usersCollection.updateOne(
         { telegramId: userId.toString() },
-        {
-          $push: {
-            [`wallets.${network}`]: encryptedData
-          }
-        },
+        { $push: { [`wallets.${network}`]: encryptedData } },
         { upsert: true }
       );
 
-      this.cacheWallet(userId, wallet.address, {
-        ...wallet,
-        network
-      });
+      // Increment wallet tally
+      await this.incrementWalletTally(network);
+
+      this.cacheWallet(userId, wallet.address, { ...wallet, network });
 
       this.emit('walletCreated', { userId, network, address: wallet.address });
 
       return wallet;
     } catch (error) {
-      this.emit('error', error);
+      await ErrorHandler.handle(error, null, null, 'Error creating wallet');
       throw error;
+    }
+  }
+
+  async incrementWalletTally(network) {
+    try {
+      await this.metricsCollection.updateOne(
+        { network },
+        { $inc: { walletCount: 1 } } // Increment the tally for the network
+      );
+      console.log(`✅ Incremented wallet tally for ${network}`);
+    } catch (error) {
+      console.error(`❌ Error incrementing wallet tally for ${network}:`, error);
+      throw error;
+    }
+  }
+
+  async fetchWalletMetrics() {
+    try {
+      const metrics = await this.metricsCollection.find({}).toArray();
+
+      const formattedMetrics = metrics.map((metric) => ({
+        network: metric.network,
+        walletCount: metric.walletCount,
+        lastUpdated: metric.lastUpdated || new Date(),
+      }));
+
+      console.log('✅ Fetched wallet metrics successfully:', formattedMetrics);
+
+      return formattedMetrics;
+    } catch (error) {
+      console.error('❌ Error fetching wallet metrics:', error);
+      throw new Error('Failed to fetch wallet metrics');
     }
   }
 
   async getWallet(userId, address) {
     try {
-      // Check cache first
       const cachedWallet = this.getFromCache(userId, address);
       if (cachedWallet) {
         return cachedWallet;
       }
 
-      const user = await this.usersCollection.findOne(
-        { telegramId: userId.toString() }
-      );
-
-      if (!user?.wallets) {
-        return null;
-      }
+      const user = await this.usersCollection.findOne({ telegramId: userId.toString() }).lean();
+      if (!user?.wallets) return null;
 
       for (const [network, wallets] of Object.entries(user.wallets)) {
         const wallet = wallets.find(w => w.address.toLowerCase() === address.toLowerCase());
@@ -97,7 +138,7 @@ class WalletService extends EventEmitter {
             network,
             privateKey: decrypt(wallet.encryptedPrivateKey),
             mnemonic: wallet.encryptedMnemonic ? decrypt(wallet.encryptedMnemonic) : null,
-            createdAt: wallet.createdAt
+            createdAt: wallet.createdAt,
           };
 
           this.cacheWallet(userId, address, decryptedWallet);
@@ -107,7 +148,7 @@ class WalletService extends EventEmitter {
 
       return null;
     } catch (error) {
-      this.emit('error', error);
+      await ErrorHandler.handle(error, null, null, 'Error fetching wallet');
       throw error;
     }
   }
@@ -117,24 +158,19 @@ class WalletService extends EventEmitter {
       const user = await this.usersCollection.findOne(
         { telegramId: userId.toString() },
         { projection: { wallets: 1 } }
-      );
+      ).lean();
 
-      if (!user?.wallets) {
-        return [];
-      }
+      if (!user?.wallets) return [];
 
-      const allWallets = [];
-      for (const [network, wallets] of Object.entries(user.wallets)) {
-        allWallets.push(...wallets.map(w => ({
+      return Object.entries(user.wallets).flatMap(([network, wallets]) =>
+        wallets.map(w => ({
           address: w.address,
           network,
-          createdAt: w.createdAt
-        })));
-      }
-
-      return allWallets;
+          createdAt: w.createdAt,
+        }))
+      );
     } catch (error) {
-      this.emit('error', error);
+      await ErrorHandler.handle(error, null, null, 'Error fetching wallets');
       throw error;
     }
   }
@@ -143,11 +179,7 @@ class WalletService extends EventEmitter {
     try {
       const result = await this.usersCollection.updateOne(
         { telegramId: userId.toString() },
-        {
-          $pull: {
-            [`wallets.${network}`]: { address }
-          }
-        }
+        { $pull: { [`wallets.${network}`]: { address } } }
       );
 
       if (result.modifiedCount > 0) {
@@ -158,25 +190,21 @@ class WalletService extends EventEmitter {
 
       return false;
     } catch (error) {
-      this.emit('error', error);
+      await ErrorHandler.handle(error, null, null, 'Error deleting wallet');
       throw error;
     }
   }
 
-  // Cache management methods
   cacheWallet(userId, address, walletData) {
     const key = `${userId}-${address}`;
-    this.walletCache.set(key, {
-      data: walletData,
-      timestamp: Date.now()
-    });
+    this.walletCache.set(key, { data: walletData, timestamp: Date.now() });
   }
 
   getFromCache(userId, address) {
     const key = `${userId}-${address}`;
     const cached = this.walletCache.get(key);
 
-    if (cached && (Date.now() - cached.timestamp) < this.CACHE_DURATION) {
+    if (cached && Date.now() - cached.timestamp < this.CACHE_DURATION) {
       return cached.data;
     }
 
@@ -195,11 +223,22 @@ class WalletService extends EventEmitter {
   cleanup() {
     this.walletCache.clear();
     this.removeAllListeners();
-    Object.values(this.walletProviders).forEach(provider => {
-      if (provider.cleanup) {
-        provider.cleanup();
+    Object.values(this.walletProviders).forEach(provider => provider.cleanup?.());
+    console.log('✅ WalletService cleaned up successfully.');
+  }
+
+  async checkHealth() {
+    const results = [];
+    for (const [network, provider] of Object.entries(this.walletProviders)) {
+      try {
+        await provider.checkHealth(); // Assuming each provider has a `checkHealth` method
+        results.push({ network, status: 'healthy' });
+      } catch (error) {
+        results.push({ network, status: 'unhealthy', error: error.message });
+        console.error(`❌ Health check failed for ${network}:`, error.message);
       }
-    });
+    }
+    return results;
   }
 }
 

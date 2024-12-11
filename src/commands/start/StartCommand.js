@@ -27,7 +27,7 @@ export class StartCommand extends Command {
 
     try {
       const currentNetwork = await networkService.getCurrentNetwork(userInfo.id);
-      const user = await User.findOne({ telegramId: userInfo.id.toString() });
+      const user = await User.findOne({ telegramId: userInfo.id.toString() }).lean();
 
       // Send welcome animation with message
       const startMessage = `

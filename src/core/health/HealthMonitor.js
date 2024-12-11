@@ -1,46 +1,76 @@
-// src/core/health/HealthMonitor.js
 import { EventEmitter } from 'events';
+import { aiMetricsService } from '../../services/aiMetricsService.js';
 import { db } from '../database.js';
 import { networkService } from '../../services/network/index.js';
 import { walletService } from '../../services/wallet/index.js';
-import { pumpFunService } from '../../services/pumpfun.js';
+import { pumpFunService } from '../../services/pumpfun/index.js';
+import { ErrorHandler } from '../errors/index.js';
+import { config } from '../config.js';
 
 export class HealthMonitor extends EventEmitter {
   constructor() {
     super();
     this.services = new Map();
-    this.setupChecks();
-    this.startMonitoring();
+    this.monitoringInterval = null;
+    this.intervalDuration = config?.monitoringInterval || 60000; // Default to 1 minute
+    this.isInitialized = false;
+    this.restartAttempts = new Map(); // Track restart attempts per service
+    this.maxRestartAttempts = 5; // Limit the number of restart attempts
+    this.errorLogs = []; // Store error logs for reference
   }
 
-  setupChecks() {
-    // Database health check
-    this.addCheck('database', async () => {
-      await db.getDatabase().command({ ping: 1 });
-      return { status: 'healthy' };
-    });
+  async initialize() {
+    if (this.isInitialized) return;
 
-    // Network service health check
-    this.addCheck('networks', async () => {
-      const statuses = await networkService.checkAllNetworks();
-      return { status: 'healthy', details: statuses };
-    });
+    try {
+      console.log('🔧 Initializing HealthMonitor dependencies...');
+      
+      // Initialize dependencies (lazy loading or setup as needed)
+      await aiMetricsService.initialize()
 
-    // Wallet service health check
-    this.addCheck('walletService', async () => {
-      const status = await walletService.checkHealth();
-      return { status: 'healthy', details: status };
-    });
+      console.log('✅ Dependencies initialized. Setting up health checks...');
+      
+      // Setup health checks only after dependencies are ready
+      await this.setupChecks();
 
-    // PumpFun service health check
-    this.addCheck('pumpFun', async () => {
-      const status = await pumpFunService.checkConnection();
-      return { status: 'healthy', details: status };
-    });
+      this.isInitialized = true;
+      console.log('✅ HealthMonitor initialized successfully.');
+    } catch (error) {
+      console.error('❌ Failed to initialize HealthMonitor:', error);
+      await ErrorHandler.handle(error);
+    }
   }
+
+  async setupChecks() {
+    this.addCheck('database', async () => this.checkDatabaseHealth());
+    this.addCheck('aiMetrics', async () => this.checkServiceHealth(aiMetricsService));
+    this.addCheck('networks', async () => networkService.checkHealth());
+    this.addCheck('walletService', async () => walletService.checkHealth());
+    this.addCheck('pumpFun', async () => pumpFunService.checkHealth());
+  }  
 
   addCheck(name, checkFn) {
     this.services.set(name, checkFn);
+  }
+
+  async checkDatabaseHealth() {
+    try {
+      await db.checkHealth();
+      return { status: 'healthy', timestamp: new Date().toISOString() };
+    } catch (error) {
+      throw new Error(`Database unreachable: ${error.message}`);
+    }
+  }
+
+  async checkServiceHealth(service) {
+    try {
+      if (service.checkHealth) {
+        return await service.checkHealth();
+      }
+      throw new Error(`Health check not implemented for service ${service.constructor.name}`);
+    } catch (error) {
+      throw new Error(`${service.constructor.name} unreachable: ${error.message}`);
+    }
   }
 
   async checkHealth() {
@@ -49,45 +79,125 @@ export class HealthMonitor extends EventEmitter {
       try {
         results[name] = await checkFn();
       } catch (error) {
-        results[name] = {
+        const formattedError = {
           status: 'error',
-          error: error.message
+          error: error.message,
+          timestamp: new Date().toISOString(),
         };
-        this.emit('serviceError', { service: name, error });
+  
+        results[name] = formattedError;
+  
+        this.logError(error, `Health check failed for service: ${name}`);
+        this.emit('serviceError', { service: name, error: formattedError });
+  
+        // Attempt to restart the service
+        await this.restartService(name);
       }
     }
     return results;
+  }  
+
+  logError(error, context = null) {
+    const logEntry = {
+      error: error.message,
+      stack: error.stack,
+      context,
+      timestamp: new Date().toISOString(),
+    };
+    this.errorLogs.push(logEntry);
+
+    // Limit logs to prevent memory overflow
+    if (this.errorLogs.length > 100) {
+      this.errorLogs.shift();
+    }
+
+    console.error('🔴 Logged error:', logEntry);
   }
 
-  startMonitoring() {
-    setInterval(async () => {
-      const health = await this.checkHealth();
-      this.emit('healthCheck', health);
-      
-      // Check for critical issues
-      const criticalServices = ['database', 'networks'];
-      const criticalIssues = criticalServices
-        .filter(service => health[service]?.status === 'error');
-      
-      if (criticalIssues.length > 0) {
-        this.emit('criticalError', {
-          services: criticalIssues,
-          health
-        });
+  async restartService(serviceName) {
+    const restartCount = this.restartAttempts.get(serviceName) || 0;
+
+    if (restartCount >= this.maxRestartAttempts) {
+      console.warn(`Max restart attempts reached for service: ${serviceName}`);
+      return;
+    }
+
+    console.warn(`Attempting to restart service: ${serviceName} (Attempt ${restartCount + 1})`);
+
+    const exponentialDelay = Math.min(1000 * 2 ** restartCount, 30000);
+    this.restartAttempts.set(serviceName, restartCount + 1);
+
+    setTimeout(async () => {
+      try {
+        const service = this.getServiceInstance(serviceName);
+        if (service && service.initialize) {
+          await service.initialize();
+          console.log(`✅ Service ${serviceName} restarted successfully.`);
+          this.restartAttempts.delete(serviceName); // Reset restart attempts on success
+        } else {
+          console.error(`Restart logic not implemented for service: ${serviceName}`);
+        }
+      } catch (error) {
+        console.error(`Failed to restart service: ${serviceName}`, error);
+        await ErrorHandler.handle(error);
       }
-    }, 60000); // Check every minute
+    }, exponentialDelay);
+  }
+
+  getServiceInstance(serviceName) {
+    const serviceMap = {
+      database: db,
+      aiMetrics: aiMetricsService,
+      networks: networkService,
+      walletService: walletService,
+      pumpFun: pumpFunService,
+    };
+
+    return serviceMap[serviceName];
+  }
+
+  async startMonitoring() {
+    const executeHealthCheck = async () => {
+      try {
+        const health = await this.checkHealth();
+        this.emit('healthCheck', health);
+
+        // Check for critical issues
+        const criticalServices = ['database', 'networks'];
+        const criticalIssues = criticalServices.filter(
+          (service) => health[service]?.status === 'error'
+        );
+
+        if (criticalIssues.length > 0) {
+          this.emit('criticalError', {
+            services: criticalIssues,
+            health,
+          });
+        }
+      } catch (error) {
+        console.error('Error during health monitoring:', error);
+        await ErrorHandler.handle(error);
+      } finally {
+        this.monitoringInterval = setTimeout(executeHealthCheck, this.intervalDuration);
+      }
+    };
+
+    console.log('⏳ Starting HealthMonitor health checks...');
+    await executeHealthCheck();
+  }
+
+  stopMonitoring() {
+    if (this.monitoringInterval) {
+      clearTimeout(this.monitoringInterval);
+      this.monitoringInterval = null;
+    }
   }
 
   cleanup() {
+    this.stopMonitoring();
     this.removeAllListeners();
-    clearInterval(this.monitoringInterval);
+    console.log('🧹 HealthMonitor cleaned up.');
   }
 }
 
 export const healthMonitor = new HealthMonitor();
-
-// Handle critical errors
-healthMonitor.on('criticalError', async ({ services, health }) => {
-  console.error('Critical service failure:', services);
-  // Implement notification/alerting system
-});
